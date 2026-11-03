@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="format-detection" content="telephone=no">
+<title>iPad 副屏</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-text-size-adjust: 100%;
+    font: 12px/1.5 -apple-system, "SF Mono", Menlo, Consolas, monospace;
+    color: #ddd;
+  }
+  #mjpeg {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    width: 100%; height: 100%;
+    background: #000;
+    display: none;
+    z-index: 2;
+  }
+  #screen {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    width: 100%; height: 100%;
+    display: block;
+    z-index: 1;
+  }
+  #hud {
+    position: fixed; top: 0; left: 0; padding: 6px 10px;
+    background: rgba(0,0,0,.6);
+    border-bottom-right-radius: 8px;
+    white-space: pre; pointer-events: none;
+    font-size: 11px; line-height: 1.45;
+    opacity: 0; z-index: 5;
+    -webkit-transition: opacity .15s; transition: opacity .15s;
+  }
+  #hud.on { opacity: 1; }
+  #hud .err { color: #f87171; }
+  #center {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    display: -webkit-box;
+    display: -webkit-flex;
+    display: flex;
+    -webkit-box-orient: vertical;
+    -webkit-flex-direction: column;
+    flex-direction: column;
+    -webkit-box-pack: center;
+    -webkit-justify-content: center;
+    justify-content: center;
+    -webkit-box-align: center;
+    -webkit-align-items: center;
+    align-items: center;
+    text-align: center; padding: 24px;
+    background: #05070a;
+    z-index: 4;
+  }
+  #center.hidden { display: none; }
+  #center h1 { font-size: 20px; font-weight: 600; margin: 0 0 10px; }
+  #center p { margin: 4px 0; color: #8b95a5; font-size: 13px; max-width: 420px; }
+  #center .err { color: #f87171; }
+  .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #f59e0b; margin-bottom: 14px;
+    -webkit-animation: pulse 1.1s infinite; animation: pulse 1.1s infinite;
+  }
+  @-webkit-keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  @keyframes pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  #diag { font-size: 10px; color: #556; margin-top: 12px; white-space: pre-wrap; text-align: left; }
+</style>
+</head>
+<body>
+<img id="mjpeg" src="" alt="">
+<canvas id="screen"></canvas>
+<div id="hud"></div>
+<div id="center">
+  <div class="dot"></div>
+  <h1>正在连接电脑</h1>
+  <p id="msg">初始化…</p>
+  <p id="err"></p>
+  <div id="diag"></div>
+</div>
+
+<script>
+/* ES5 only.
+   This iPad reports iOS 9.2 / WebKit 601, which cannot parse async/await,
+   arrow functions, template literals or `let`. Anything newer in here makes
+   the whole script fail to parse and nothing runs at all. */
+(function () {
+  'use strict';
+
+  var hasWebCodecs = (typeof window.VideoDecoder === 'function');
+
+  var canvas = document.getElementById('screen');
+  var ctx = canvas.getContext('2d');
+  var hud = document.getElementById('hud');
+  var center = document.getElementById('center');
+  var msgEl = document.getElementById('msg');
+  var errEl = document.getElementById('err');
+  var diagEl = document.getElementById('diag');
+  var mjpegImg = document.getElementById('mjpeg');
+
+  var state = {
+    ws: null,
+    decoder: null,
+    codec: null,
+    offset: 0,
+    synced: false,
+    lastTs: 0,
+    frames: 0,
+    fps: 0,
+    bytes: 0,
+    kbps: 0,
+    latency: 0,
+    waitingKey: true,
+    gotFirstFrame: false,
+    mjpeg: false,
+    fmt: 'annexb',
+    decoderCfg: null,
+    reconnects: 0
+  };
+
+  function setMsg(t) { msgEl.innerHTML = t; }
+  function setErr(t) { errEl.innerHTML = t ? '<span class="err">' + t + '</span>' : ''; }
+
+  window.onerror = function (m, f, l) {
+    setErr('脚本错误: ' + m + (l ? ' @' + l : ''));
+    return true;
+  };
+
+  diagEl.textContent =
+    'UA: ' + navigator.userAgent + '\n' +
+    'WebCodecs: ' + hasWebCodecs + '\n' +
+    'secure: ' + (window.isSecureContext === true);
+
+  // ---------------------------------------------------------------- MJPEG
+  // Works on every browser back to iOS 6: it is just an <img> fed by a
+  // multipart/x-mixed-replace response.
+  function startMjpeg() {
+    if (state.mjpeg) return;
+    state.mjpeg = true;
+    center.className = 'hidden';
+
+    // Default to a size this class of device can actually decode at speed;
+    // ?w=1280 or ?w=1600 trades latency back for sharpness.
+    var w = 1024, q = 7, fps = 20;
+    var m = location.search.match(/[?&]w=(\d+)/); if (m) w = parseInt(m[1], 10);
+    m = location.search.match(/[?&]q=(\d+)/); if (m) q = parseInt(m[1], 10);
+    m = location.search.match(/[?&]fps=(\d+)/); if (m) fps = parseInt(m[1], 10);
+
+    mjpegImg.style.display = 'block';
+    mjpegImg.src = '/mjpeg?w=' + w + '&q=' + q + '&fps=' + fps + '&t=' + (new Date()).getTime();
+
+    hud.className = 'on';
+    hud.innerHTML = '<b>模式</b>    MJPEG 兼容模式\n' +
+                    '<b>申请</b>    宽 ' + w + ' / 质量 ' + q + ' / ' + fps + 'fps\n' +
+                    '<b>屏幕</b>    ' + (window.screen ? window.screen.width + 'x' + window.screen.height : '?') +
+                    ' @' + (window.devicePixelRatio || 1) + 'x';
+  }
+
+  // ---------------------------------------------------------------- WebSocket
+  function connect() {
+    var proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
+    var url = proto + '//' + location.host + '/';
+    setMsg('正在连接 ' + url);
+
+    var ws;
+    try {
+      ws = new WebSocket(url);
+    } catch (e) {
+      setErr('WebSocket 创建失败: ' + e.message);
+      return;
+    }
+    ws.binaryType = 'arraybuffer';
+    state.ws = ws;
+
+    ws.onopen = function () {
+      setMsg('已连接，等待画面…');
+      document.getElementById('center').getElementsByTagName('div')[0].style.background = '#10b981';
+      syncClock();
+      setInterval(syncClock, 5000);
+      setInterval(reportStats, 1000);
+      setTimeout(function () {
+        if (!state.gotFirstFrame && !state.mjpeg) {
+          setMsg('已连接但没收到画面，切换到兼容模式…');
+          startMjpeg();
+        }
+      }, 8000);
+    };
+
+    ws.onclose = function (ev) {
+      state.reconnects++;
+      setErr('连接断开 (' + ev.code + ')，重连中…');
+      setTimeout(connect, 1500);
+    };
+
+    ws.onerror = function () {
+      setErr('连接出错');
+    };
+
+    ws.onmessage = function (ev) {
+      if (typeof ev.data === 'string') { onControl(JSON.parse(ev.data)); return; }
+      onFrame(ev.data);
+    };
+  }
+
+  function syncClock() {
+    if (!state.ws || state.ws.readyState !== 1) return;
+    state.ws.send(JSON.stringify({ t: 'time', c0: (new Date()).getTime() }));
+  }
+
+  function onControl(m) {
+    if (m.t === 'codec') {
+      state.codec = m.codec;
+      if (m.width) cfgW = m.width;
+      if (m.height) cfgH = m.height;
+      if (m.sps && m.pps) {
+        cfgSps = b64ToBytes(m.sps);
+        cfgPps = b64ToBytes(m.pps);
+      }
+      state.waitingKey = true;
+      setupDecoder(m.codec);
+    } else if (m.t === 'waiting') {
+      setMsg('编码器启动中…');
+    } else if (m.t === 'time') {
+      var now = (new Date()).getTime();
+      var rtt = now - m.c0;
+      state.offset = m.s - (m.c0 + rtt / 2);
+      state.synced = true;
+    }
+  }
+
+  // ---------------------------------------------------------------- decoding
+  var cfgW = 1920;
+  var cfgH = 1080;
+  var cfgSps = null;
+  var cfgPps = null;
+
+  function b64ToBytes(b64) {
+    var bin = atob(b64);
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function buildAvcC(sps, pps) {
+    var out = new Uint8Array(11 + sps.length + pps.length);
+    var o = 0;
+    out[o++] = 1;
+    out[o++] = sps[1];
+    out[o++] = sps[2];
+    out[o++] = sps[3];
+    out[o++] = 0xFF;
+    out[o++] = 0xE1;
+    out[o++] = (sps.length >> 8) & 0xff;
+    out[o++] = sps.length & 0xff;
+    out.set(sps, o); o += sps.length;
+    out[o++] = 1;
+    out[o++] = (pps.length >> 8) & 0xff;
+    out[o++] = pps.length & 0xff;
+    out.set(pps, o);
+    return out;
+  }
+
+  function makeConfig(codec, fmt, extras) {
+    var c = { codec: codec, codedWidth: cfgW, codedHeight: cfgH };
+    if (fmt) {
+      c.avc = { format: fmt };
+    } else if (cfgSps && cfgPps) {
+      c.description = buildAvcC(cfgSps, cfgPps);
+    }
+    c.hardwareAcceleration = extras ? 'prefer-hardware' : 'no-preference';
+    if (extras) c.optimizeForLatency = true;
+    return c;
+  }
+
+  function setupDecoder(codec) {
+    if (typeof VideoDecoder === 'undefined') {
+      startMjpeg();
+      return;
+    }
+    var forced = location.search.indexOf('fmt=avcc') >= 0 ? 'avcc'
+               : location.search.indexOf('fmt=annexb') >= 0 ? 'annexb' : null;
+
+    var candidates = [
+      { fmt: 'annexb', cfg: makeConfig(codec, 'annexb', true) },
+      { fmt: 'annexb', cfg: makeConfig(codec, 'annexb', false) },
+      { fmt: 'avcc', cfg: makeConfig(codec, null, true) },
+      { fmt: 'avcc', cfg: makeConfig(codec, null, false) }
+    ];
+    if (forced === 'annexb') candidates = [candidates[0]];
+    if (forced === 'avcc') candidates = [candidates[2]];
+
+    var idx = 0;
+
+    function tryNext() {
+      if (idx >= candidates.length) {
+        setErr('所有解码配置都不被支持，改用兼容模式');
+        startMjpeg();
+        return;
+      }
+      var cand = candidates[idx++];
+      var dec = new VideoDecoder({
+        output: onDecodedFrame,
+        error: function (e) {
+          setErr('解码错误: ' + e.message);
+          state.waitingKey = true;
+          try { dec.reset(); } catch (x) {}
+          try { dec.configure(state.decoderCfg); } catch (x) {}
+        }
+      });
+
+      if (typeof VideoDecoder.isConfigSupported === 'function') {
+        VideoDecoder.isConfigSupported(cand.cfg).then(function (r) {
+          if (r && r.supported) { accept(cand, dec); } else { tryNext(); }
+        })['catch'](function () { tryNext(); });
+      } else {
+        accept(cand, dec);
+      }
+    }
+
+    function accept(cand, dec) {
+      try {
+        dec.configure(cand.cfg);
+      } catch (e) {
+        tryNext();
+        return;
+      }
+      state.fmt = cand.fmt;
+      state.decoderCfg = cand.cfg;
+      state.decoder = dec;
+      hud.className = 'on';
+      hud.innerHTML = '<b>codec</b>  ' + codec + '\n<b>封装</b>   ' + cand.fmt + '\n等待关键帧…';
+    }
+
+    tryNext();
+  }
+
+  function annexbToAvcc(bytes) {
+    var nals = [];
+    var i = 0, total = 0;
+    while (i + 3 < bytes.length) {
+      var sc = -1;
+      if (bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 1) sc = 3;
+      else if (i + 4 < bytes.length && bytes[i] === 0 && bytes[i + 1] === 0 && bytes[i + 2] === 0 && bytes[i + 3] === 1) sc = 4;
+      if (sc < 0) { i++; continue; }
+
+      var start = i + sc;
+      var next = bytes.length;
+      for (var k = start; k + 3 <= bytes.length; k++) {
+        if (bytes[k] === 0 && bytes[k + 1] === 0 && bytes[k + 2] === 1) {
+          next = (k > start && bytes[k - 1] === 0) ? k - 1 : k;
+          break;
+        }
+      }
+      var nal = bytes.subarray(start, next);
+      nals.push(nal);
+      total += 4 + nal.length;
+      i = next;
+    }
+
+    var out = new Uint8Array(total);
+    var view = new DataView(out.buffer);
+    var off = 0;
+    for (var n = 0; n < nals.length; n++) {
+      view.setUint32(off, nals[n].length, false);
+      out.set(nals[n], off + 4);
+      off += 4 + nals[n].length;
+    }
+    return out;
+  }
+
+  function onDecodedFrame(frame) {
+    state.frames++;
+    if (state.mjpeg) {
+      state.mjpeg = false;
+      mjpegImg.style.display = 'none';
+      mjpegImg.src = '';
+    }
+    if (!state.gotFirstFrame) {
+      state.gotFirstFrame = true;
+      center.className = 'hidden';
+      hud.className = 'on';
+      resizeCanvas(frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight);
+    }
+    draw(frame, state.lastTs);
+    frame.close();
+  }
+
+  function onFrame(buf) {
+    if (!state.decoder || state.decoder.state !== 'configured') return;
+    var dv = new DataView(buf);
+    if (dv.getUint8(0) !== 0x01) return;
+    var ts = dv.getFloat64(5, true);
+    var isKey = dv.getUint8(13) === 1;
+    var payload = new Uint8Array(buf, 14);
+
+    state.bytes += payload.length;
+
+    if (state.waitingKey) {
+      if (!isKey) return;
+      state.waitingKey = false;
+      try { state.decoder.reset(); } catch (x) {}
+      try { state.decoder.configure(state.decoderCfg); } catch (x) {}
+    }
+
+    if (state.decoder.decodeQueueSize > 12) {
+      state.waitingKey = true;
+      return;
+    }
+
+    if (state.fmt === 'avcc') payload = annexbToAvcc(payload);
+
+    state.lastTs = ts;
+    try {
+      state.decoder.decode(new EncodedVideoChunk({
+        type: isKey ? 'key' : 'delta',
+        timestamp: Math.round(ts * 1000),
+        data: payload
+      }));
+    } catch (e) {
+      setErr('送入解码器失败: ' + e.message);
+    }
+  }
+
+  // ---------------------------------------------------------------- rendering
+  var dst = { x: 0, y: 0, w: 0, h: 0 };
+
+  function resizeCanvas(vw, vh) {
+    var dpr = window.devicePixelRatio || 1;
+    if (dpr > 2) dpr = 2;
+    var cw = Math.round(window.innerWidth * dpr);
+    var ch = Math.round(window.innerHeight * dpr);
+    canvas.width = cw;
+    canvas.height = ch;
+    var scale = Math.min(cw / vw, ch / vh);
+    dst.w = Math.round(vw * scale);
+    dst.h = Math.round(vh * scale);
+    dst.x = Math.round((cw - dst.w) / 2);
+    dst.y = Math.round((ch - dst.h) / 2);
+  }
+
+  function draw(frame, ts) {
+    if (!dst.w) resizeCanvas(frame.displayWidth || frame.codedWidth, frame.displayHeight || frame.codedHeight);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(frame, dst.x, dst.y, dst.w, dst.h);
+    if (state.synced && ts) {
+      state.latency = Math.max(0, (new Date()).getTime() - (ts - state.offset));
+    }
+  }
+
+  window.onresize = function () {
+    if (dst.w) resizeCanvas(1920, 1080);
+  };
+
+  var lastFpsTime = 0, lastFpsFrames = 0;
+
+  function reportStats() {
+    var now = (new Date()).getTime();
+    if (lastFpsTime && now > lastFpsTime) {
+      state.fps = Math.round((state.frames - lastFpsFrames) * 1000 / (now - lastFpsTime));
+    }
+    lastFpsTime = now;
+    lastFpsFrames = state.frames;
+
+    if (state.mjpeg) return;
+    var q = state.decoder ? state.decoder.decodeQueueSize : 0;
+    hud.className = 'on';
+    hud.innerHTML =
+      '<b>codec</b>   ' + (state.codec || '-') + '\n' +
+      '<b>封装</b>    ' + state.fmt + '\n' +
+      '<b>fps</b>     ' + state.fps + '\n' +
+      '<b>延迟</b>    ' + state.latency + ' ms\n' +
+      '<b>队列</b>    ' + q;
+  }
+
+  // ---------------------------------------------------------------- start
+  // Tapping hides Safari's chrome a little more reliably.
+  document.body.addEventListener('touchstart', function () {
+    window.scrollTo(0, 1);
+  }, false);
+
+  window.addEventListener('load', function () {
+    setTimeout(function () { window.scrollTo(0, 1); }, 100);
+  }, false);
+
+  if (hasWebCodecs) {
+    connect();
+  } else {
+    startMjpeg();
+  }
+})();
+</script>
+</body>
+</html>

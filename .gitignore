@@ -1,0 +1,21 @@
+# dependencies and downloaded tools
+node_modules/
+test/node_modules/
+
+# third-party binaries (downloaded by the user, never committed)
+vendor/
+tools/
+
+# runtime state
+tmp/
+*.log
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# test artifacts (may contain screen contents)
+test/*.png
+tmp/
+

@@ -1,0 +1,15 @@
+{
+  "name": "ipad-second-screen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Stream a Windows desktop to an iPad as a low-latency secondary display",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0",
+    "selfsigned": "^2.4.1",
+    "ws": "^8.18.0"
+  }
+}

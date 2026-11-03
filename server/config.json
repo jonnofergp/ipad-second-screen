@@ -1,0 +1,15 @@
+{
+  "outputIdx": 1,
+  "captureWidth": 1600,
+  "fps": 60,
+  "bitrateMbps": 40,
+  "quality": 21,
+  "preset": "p6",
+  "tune": "hq",
+  "mjpegMaxWidth": 1280,
+  "mjpeg": {
+    "fps": 20,
+    "width": 1024,
+    "quality": 7
+  }
+}
