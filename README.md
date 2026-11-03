@@ -108,6 +108,8 @@ and the mouse crosses over normally.
 | `mjpegMaxWidth` | `1280` | upper bound for the MJPEG downscale |
 | `mjpeg.fps` | `20` | MJPEG frame rate |
 | `mjpeg.quality` | `7` | MJPEG `-q:v`, higher is smaller/lossier |
+| `mjpeg.pixFmt` | `yuvj444p` | chroma sampling; 4:4:4 keeps coloured text edges sharp |
+| `input` | `{x,y,width,height}` | geometry of the streamed display, for touch mapping |
 
 The MJPEG path also accepts overrides in the URL, which is handy for tuning
 from the tablet itself:
@@ -117,6 +119,28 @@ https://<pc-ip>:8443/?w=1024&q=7&fps=20
 https://<pc-ip>:8443/?w=1280&q=6      # sharper, slower
 https://<pc-ip>:8443/?fmt=avcc        # force AVCC framing
 ```
+
+## Touch input
+
+The tablet can drive the PC: one finger taps and drags, two fingers scroll.
+Touches are mapped onto the captured display's rectangle and injected with
+`SendInput` by a small C# helper that is compiled on first use.
+
+```
+iPAD  ── POST /input {t:"m",x:0.42,y:0.18} ──▶  server  ── stdin ──▶ input-inject.exe ──▶ SendInput
+```
+
+Implementation notes:
+
+* Input travels over **plain HTTPS POSTs, not a WebSocket**. iOS 9 Safari
+  rejects `wss://` against a self-signed certificate even after the page itself
+  has been accepted, so a control socket silently never connects.
+* The helper is built from `server/input-inject.cs` with the `csc.exe` that
+  ships with .NET Framework — no compiler install, no admin rights, nothing
+  binary in the repo.
+* Windows blocks synthetic input to **elevated** windows (UIPI), so Task
+  Manager and friends cannot be driven. Everything else works.
+* Keyboard input is not implemented yet.
 
 ## Things that were not obvious
 
@@ -135,19 +159,31 @@ https://<pc-ip>:8443/?fmt=avcc        # force AVCC framing
   (validated with `acorn --ecma-version 5`).
 * **`inset: 0` is Safari 14.1+.** On older WebKit it silently does nothing and
   your centered overlay ends up jammed in the top-left corner.
+* **`object-fit` is Safari 10+.** On iOS 9 it is ignored, the image stretches to
+  the viewport, and any letterbox-aware touch mapping is then wrong by tens of
+  pixels near the edges. The client sizes and centres the `<img>` in JavaScript
+  instead.
+* **4:2:0 chroma subsampling is what makes coloured text look fuzzy.** Switching
+  the MJPEG encoder to `yuvj444p` costs ~17% more bytes and visibly sharpens
+  text edges.
+* **The virtual display forgets its resolution on reboot.** It comes back at
+  1280×720, which is both smaller and the wrong aspect ratio; `ensure-display.ps1`
+  restores the 4:3 mode at start-up.
 
 ## Repository layout
 
 ```
-client/index.html      ES5 client: WebCodecs + MJPEG fallback
-server/server.js       HTTP/HTTPS, ffmpeg pipelines, WebSocket fan-out
-server/config.json     runtime settings
-server/test-client.js  headless stream check (no tablet needed)
+client/index.html         ES5 client: WebCodecs + MJPEG fallback, touch input
+server/server.js          HTTP/HTTPS, ffmpeg pipelines, WebSocket fan-out
+server/input-inject.cs    C# helper that turns stdin commands into SendInput
+server/config.json        runtime settings
+server/test-client.js     headless stream check (no tablet needed)
 server/capture-stream.js  dumps the stream to .h264 for offline validation
-test/e2e.js            headless Chromium end-to-end
-test/decoder-test.js   Annex-B/AVCC conversion + forced path
-test/webkit-test.js    WebKit engine run (exercises the MJPEG fallback)
-*.bat                  one-click launchers (ASCII only — see below)
+ensure-display.ps1        restores the virtual display's 4:3 mode at start-up
+test/e2e.js               headless Chromium end-to-end
+test/decoder-test.js      Annex-B/AVCC conversion + forced path
+test/webkit-test.js       WebKit engine run (exercises the MJPEG fallback)
+*.bat                     one-click launchers (ASCII only — see below)
 ```
 
 > The `.bat` files contain **only ASCII**. A batch file with non-ASCII text plus
@@ -162,12 +198,15 @@ test/webkit-test.js    WebKit engine run (exercises the MJPEG fallback)
 | "connection reset" in server log | client sent plain HTTP to the TLS port |
 | Everything is black | no window has been moved to the virtual display yet |
 | Laggy dragging | expected on old tablets; lower `w`/`fps` or use the WebCodecs path |
+| Taps land in the wrong place | the image is being stretched instead of letterboxed — check `layoutMjpeg()` ran |
+| Touch does nothing | `wss://` was rejected by iOS; input must go over POST `/input` |
 
 ## Limitations
 
-* No input forwarding — the tablet is read-only.
 * Old iPads (iOS 9) have no hardware H.264 decode path in Safari, so MJPEG is
   the ceiling and the experience stays noticeably laggy for interactive work.
+* Input cannot reach elevated (administrator) windows — a Windows UIPI rule.
+* No keyboard forwarding yet.
 * No authentication: anyone on the LAN can view the screen after accepting the
   certificate. Home-network tool.
 
@@ -179,10 +218,12 @@ test/webkit-test.js    WebKit engine run (exercises the MJPEG fallback)
 - **新设备**（iPadOS 16.4+）：NVENC 硬件编码 → WebSocket → WebCodecs 硬解，
   延迟 30~80ms，桌面约 3 Mbps
 - **老设备**：自动降级为 MJPEG（`<img>` 吃 multipart 流），兼容到 iOS 6
+- **触摸控制**：单指点击/拖动、双指滚动，经 `SendInput` 注入真实鼠标事件
 
 关键坑：自签证书有效期必须 ≤ 825 天（Apple 强制），否则 iOS 直接拒绝且不给
 「继续访问」选项；老 iOS 的 JS 解析器不支持 `async/await`，整个页面会静默失效，
-所以客户端严格用 ES5 写成。
+所以客户端严格用 ES5 写成；iOS 9 的 Safari 还拒绝用自签证书建立 `wss://`，
+控制指令只能走普通 POST。
 
 ## Credits
 

@@ -17,7 +17,7 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const { WebSocketServer } = require('ws');
 
 const ROOT = path.resolve(__dirname, '..');
@@ -53,6 +53,14 @@ const CONFIG = {
   // MJPEG is downscaled to this width; an old tablet decodes 1600px JPEGs too
   // slowly and falls behind, which is what makes the picture drift late.
   mjpegMaxWidth: Number(process.env.MJPEG_MAX_WIDTH ?? FILE_CFG.mjpegMaxWidth ?? 1280),
+  // Geometry of the display being streamed, in virtual-desktop pixels. Touch
+  // coordinates arrive normalised and are mapped onto this rectangle.
+  input: {
+    x: Number((FILE_CFG.input && FILE_CFG.input.x) ?? 1920),
+    y: Number((FILE_CFG.input && FILE_CFG.input.y) ?? 0),
+    width: Number((FILE_CFG.input && FILE_CFG.input.width) ?? 1600),
+    height: Number((FILE_CFG.input && FILE_CFG.input.height) ?? 1200),
+  },
 };
 
 function jpegHash(buf) {
@@ -452,6 +460,9 @@ const MJPEG = {
   fps: Number(process.env.MJPEG_FPS ?? (FILE_CFG.mjpeg && FILE_CFG.mjpeg.fps) ?? 12),
   width: Number(process.env.MJPEG_WIDTH ?? (FILE_CFG.mjpeg && FILE_CFG.mjpeg.width) ?? 1366),
   quality: Number(process.env.MJPEG_QUALITY ?? (FILE_CFG.mjpeg && FILE_CFG.mjpeg.quality) ?? 8),
+  // 4:4:4 keeps chroma at full resolution, which is exactly what coloured text
+  // edges need; 4:2:0 smears them. Costs roughly 15-20% more bytes.
+  pixFmt: process.env.MJPEG_PIX_FMT ?? (FILE_CFG.mjpeg && FILE_CFG.mjpeg.pixFmt) ?? 'yuvj444p',
 };
 
 class MjpegCapture {
@@ -476,10 +487,11 @@ class MjpegCapture {
       '-vf', scale,
       '-c:v', 'mjpeg',
       '-q:v', String(cfg.quality),
+      '-pix_fmt', cfg.pixFmt || MJPEG.pixFmt || 'yuvj444p',
       '-f', 'mjpeg',
       'pipe:1',
     ];
-    this.opts = { width: cfg.width, fps: cfg.fps, quality: cfg.quality };
+    this.opts = { width: cfg.width, fps: cfg.fps, quality: cfg.quality, pixFmt: cfg.pixFmt || MJPEG.pixFmt };
     console.log('[mjpeg]', args.join(' '));
     const proc = spawn(FFMPEG, args, { windowsHide: true });
     this.proc = proc;
@@ -528,9 +540,11 @@ class MjpegCapture {
 
     for (const res of this.clients) {
       try {
-        // Back-pressure: if this viewer still has a backlog queued, drop the
-        // frame instead of stacking more delay on top.
-        if (res.writableLength > 200000) { this.dropped = (this.dropped || 0) + 1; continue; }
+        // Back-pressure: keep at most ~1 frame in flight. Allowing two or three
+        // frames to queue silently adds 100-200 ms of delay, which is exactly
+        // what "a little laggy" feels like. Dropping is the lesser evil.
+        const budget = Math.max(65536, Math.round(jpeg.length * 1.5));
+        if (res.writableLength > budget) { this.dropped = (this.dropped || 0) + 1; continue; }
         this.writeFrame(res, jpeg);
       } catch {
         this.clients.delete(res);
@@ -589,7 +603,114 @@ class MjpegCapture {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Input injection — forwards tablet touches to the real Windows cursor.
+// A tiny C# helper (server/input-inject.cs) is compiled on demand and kept
+// alive; commands are one line each over its stdin.
+// ---------------------------------------------------------------------------
+
+const INJECT_SRC = path.join(__dirname, 'input-inject.cs');
+const INJECT_EXE = path.join(ROOT, 'vendor', 'bin', 'input-inject.exe');
+
+function ensureInjector() {
+  if (fs.existsSync(INJECT_EXE)) return INJECT_EXE;
+  const candidates = [
+    path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
+    path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework', 'v4.0.30319', 'csc.exe'),
+  ];
+  const csc = candidates.find((p) => fs.existsSync(p));
+  if (!csc) throw new Error('csc.exe not found; cannot build the input injector');
+  fs.mkdirSync(path.dirname(INJECT_EXE), { recursive: true });
+  execFileSync(csc, ['/nologo', '/target:exe', '/optimize+', `/out:${INJECT_EXE}`, INJECT_SRC], { windowsHide: true });
+  console.log('[input] built injector');
+  return INJECT_EXE;
+}
+
+class InputInjector {
+  constructor() {
+    this.proc = null;
+    this.users = 0;
+    this.ready = false;
+    this.queue = [];
+  }
+
+  ensureRunning() {
+    if (this.proc) return;
+    try {
+      const exe = ensureInjector();
+      const r = CONFIG.input;
+      this.proc = spawn(exe, [r.x, r.y, r.width, r.height], { windowsHide: true });
+      this.ready = false;
+      this.queue = [];
+      this.proc.stdout.on('data', (d) => {
+        if (String(d).indexOf('ready') >= 0) {
+          this.ready = true;
+          console.log(`[input] injector ready, display=${r.width}x${r.height}+${r.x}+${r.y}`);
+          for (const cmd of this.queue) this.raw(cmd);
+          this.queue = [];
+        }
+      });
+      this.proc.stderr.on('data', (d) => console.log('[input:err]', String(d).trim()));
+      this.proc.on('exit', () => { this.proc = null; this.ready = false; this.queue = []; });
+    } catch (e) {
+      console.error('[input] failed to start:', e.message);
+    }
+  }
+
+  // Called for every HTTP input POST; keeps the helper warm for a minute after
+  // the last touch, then lets it exit.
+  touch() {
+    this.ensureRunning();
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (this.users === 0 && this.proc) this.stop();
+    }, 60000);
+  }
+
+  acquire() {
+    this.users++;
+    this.ensureRunning();
+  }
+
+  release() {
+    this.users = Math.max(0, this.users - 1);
+    if (this.users === 0) this.stop();
+  }
+
+  stop() {
+    if (!this.proc) return;
+    try { this.proc.stdin.write('X\n'); } catch {}
+    setTimeout(() => { if (this.proc) { try { this.proc.kill(); } catch {} } }, 300);
+  }
+
+  raw(cmd) {
+    if (this.proc && this.proc.stdin.writable) {
+      try { this.proc.stdin.write(cmd + '\n'); } catch {}
+    }
+  }
+
+  send(cmd) {
+    if (!this.proc) return;
+    if (!this.ready) {
+      // Bounded queue: a burst of stale moves is useless anyway.
+      if (this.queue.length < 256) this.queue.push(cmd);
+      return;
+    }
+    this.raw(cmd);
+  }
+
+  move(x, y) { this.send(`M ${x.toFixed(4)} ${y.toFixed(4)}`); }
+  down() { this.send('D'); }
+  up() { this.send('U'); }
+  scroll(n) { this.send(`S ${Math.round(n)}`); }
+}
+
+const injector = new InputInjector();
+
 const mjpeg = new MjpegCapture();
+
+// Last geometry reported by a viewing device (see the /report endpoint).
+let lastReport = null;
 
 // ---------------------------------------------------------------------------
 // static file serving
@@ -625,6 +746,47 @@ function serveStatic(req, res) {
     mjpeg.add(req, res, opts);
     return;
   }
+  if (urlPath === '/report') {
+    // The tablet reports its panel geometry here so the stream can be sized to
+    // it instead of guessing. Visible via /health and the console.
+    const q = new URLSearchParams(req.url.split('?')[1] || '');
+    lastReport = {
+      at: new Date().toISOString(),
+      ua: String(req.headers['user-agent'] || ''),
+      screen: `${q.get('sw')}x${q.get('sh')} @${q.get('dpr')}x`,
+      viewport: `${q.get('iw')}x${q.get('ih')}`,
+      mode: q.get('mode'),
+    };
+    console.log('[report]', JSON.stringify(lastReport));
+    res.writeHead(204); res.end();
+    return;
+  }
+  if (urlPath === '/input' && req.method === 'POST') {
+    // iOS 9 Safari refuses wss:// to a self-signed certificate even after the
+    // page itself is accepted, so input travels as ordinary HTTPS POSTs.
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 2048) req.destroy(); });
+    req.on('end', () => {
+      let m = null;
+      try { m = JSON.parse(body); } catch {}
+      if (m) {
+        injector.touch();
+        if (m.t === 'm') {
+          const x = Math.max(0, Math.min(1, Number(m.x)));
+          const y = Math.max(0, Math.min(1, Number(m.y)));
+          if (Number.isFinite(x) && Number.isFinite(y)) injector.move(x, y);
+        } else if (m.t === 'd') injector.down();
+        else if (m.t === 'u') injector.up();
+        else if (m.t === 'c') { injector.down(); injector.up(); }
+        else if (m.t === 's') {
+          const n = Number(m.n);
+          if (Number.isFinite(n)) injector.scroll(n);
+        }
+      }
+      res.writeHead(204); res.end();
+    });
+    return;
+  }
   if (urlPath === '/health') {
     const body = JSON.stringify({
       ok: true,
@@ -636,7 +798,9 @@ function serveStatic(req, res) {
       mjpegDropped: mjpeg.dropped || 0,
       mjpegSkipped: mjpeg.skipped || 0,
       encoding: !!capture.proc,
+      input: { active: !!injector.proc, ready: injector.ready, rect: CONFIG.input },
       config: CONFIG,
+      lastReport,
       lastError: capture.lastError || null,
     });
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -730,9 +894,39 @@ for (const [server, label] of [[httpServer, 'http'], [httpsServer, 'https']]) {
   const wss = new WebSocketServer({ server });
   wss.on('connection', (ws, req) => {
     const ua = String(req.headers['user-agent'] || '').slice(0, 120);
-    console.log(`[ws] + ${label} ${ua}`);
+    const isControl = (req.url || '').indexOf('/control') === 0;
+    console.log(`[ws] + ${label}${isControl ? ' (control)' : ''} ${ua}`);
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
+
+    if (isControl) {
+      injector.acquire();
+      ws.on('message', (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw.toString()); } catch { return; }
+        if (msg.t === 'm') {
+          const x = Math.max(0, Math.min(1, Number(msg.x)));
+          const y = Math.max(0, Math.min(1, Number(msg.y)));
+          if (Number.isFinite(x) && Number.isFinite(y)) injector.move(x, y);
+        } else if (msg.t === 'd') {
+          injector.down();
+        } else if (msg.t === 'u') {
+          injector.up();
+        } else if (msg.t === 's') {
+          const n = Number(msg.n);
+          if (Number.isFinite(n)) injector.scroll(n);
+        } else if (msg.t === 'hello') {
+          ws.send(JSON.stringify({ t: 'input', enabled: true, rect: CONFIG.input }));
+        }
+      });
+      ws.on('close', () => {
+        injector.release();
+        console.log('[ws] - control');
+      });
+      ws.on('error', () => {});
+      return;
+    }
+
     capture.add(ws);
 
     ws.on('message', (raw) => {

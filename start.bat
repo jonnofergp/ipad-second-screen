@@ -23,6 +23,13 @@ if not exist "node_modules\ws" (
   echo.
 )
 
+rem The Parsec virtual display often falls back to 1280x720 after a reboot,
+rem which makes the picture blurry. Put it back to the 4:3 mode we want.
+if exist "%~dp0ensure-display.ps1" (
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0ensure-display.ps1"
+  echo.
+)
+
 echo Starting server...
 echo.
 node server.js

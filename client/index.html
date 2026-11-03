@@ -30,7 +30,9 @@
     width: 100%; height: 100%;
     display: block;
     z-index: 1;
+    touch-action: none;
   }
+  #mjpeg { touch-action: none; }
   #hud {
     position: fixed; top: 0; left: 0; padding: 6px 10px;
     background: rgba(0,0,0,.6);
@@ -146,9 +148,21 @@
     state.mjpeg = true;
     center.className = 'hidden';
 
-    // Default to a size this class of device can actually decode at speed;
-    // ?w=1280 or ?w=1600 trades latency back for sharpness.
-    var w = 1024, q = 7, fps = 20;
+    // Tell the server what this panel actually is, so the stream can be sized
+    // to it instead of to a guess.
+    try {
+      var rep = new Image();
+      rep.src = '/report?mode=mjpeg' +
+        '&sw=' + (window.screen ? window.screen.width : 0) +
+        '&sh=' + (window.screen ? window.screen.height : 0) +
+        '&dpr=' + (window.devicePixelRatio || 1) +
+        '&iw=' + window.innerWidth + '&ih=' + window.innerHeight +
+        '&t=' + (new Date()).getTime();
+    } catch (e) {}
+
+    // Stream at the virtual display's native size (1:1 pixels, no rescaling)
+    // and full 4:4:4 chroma. ?w=1280&q=6&fps=12 trades sharpness for smoothness.
+    var w = 1600, q = 5, fps = 15;
     var m = location.search.match(/[?&]w=(\d+)/); if (m) w = parseInt(m[1], 10);
     m = location.search.match(/[?&]q=(\d+)/); if (m) q = parseInt(m[1], 10);
     m = location.search.match(/[?&]fps=(\d+)/); if (m) fps = parseInt(m[1], 10);
@@ -160,7 +174,20 @@
     hud.innerHTML = '<b>模式</b>    MJPEG 兼容模式\n' +
                     '<b>申请</b>    宽 ' + w + ' / 质量 ' + q + ' / ' + fps + 'fps\n' +
                     '<b>屏幕</b>    ' + (window.screen ? window.screen.width + 'x' + window.screen.height : '?') +
-                    ' @' + (window.devicePixelRatio || 1) + 'x';
+                    ' @' + (window.devicePixelRatio || 1) + 'x\n' +
+                    '<b>触控</b>    单指点击/拖动，双指滚动';
+
+    // The stream has no length, so `load` never fires; poll until the first
+    // frame gives us natural dimensions, then position the image.
+    var laidOut = 0;
+    var timer = setInterval(function () {
+      var nw = mjpegImg.naturalWidth;
+      if (nw && nw !== laidOut) {
+        laidOut = nw;
+        layoutMjpeg();
+      }
+    }, 500);
+    setTimeout(function () { clearInterval(timer); }, 15000);
   }
 
   // ---------------------------------------------------------------- WebSocket
@@ -457,6 +484,7 @@
 
   window.onresize = function () {
     if (dst.w) resizeCanvas(1920, 1080);
+    layoutMjpeg();
   };
 
   var lastFpsTime = 0, lastFpsFrames = 0;
@@ -479,6 +507,107 @@
       '<b>延迟</b>    ' + state.latency + ' ms\n' +
       '<b>队列</b>    ' + q;
   }
+
+  // ---------------------------------------------------------------- input
+  // Touch is forwarded to the PC as real mouse input. It travels as ordinary
+  // HTTPS POSTs rather than a WebSocket: iOS 9 Safari rejects wss:// against a
+  // self-signed certificate even after the page itself has been accepted.
+  var touchDown = false, lastMoveAt = 0;
+
+  function ctlSend(o) {
+    try {
+      var x = new XMLHttpRequest();
+      x.open('POST', '/input', true);
+      x.setRequestHeader('Content-Type', 'application/json');
+      x.send(JSON.stringify(o));
+    } catch (e) {}
+  }
+
+  function viewRect() {
+    if (state.mjpeg) {
+      // iOS 9 Safari ignores object-fit, so the <img> is positioned by hand in
+      // layoutMjpeg(). That makes its bounding box exactly the picture area and
+      // the touch mapping becomes a plain linear scale.
+      var r = mjpegImg.getBoundingClientRect();
+      if (!r || !r.width || !r.height) return null;
+      return { x: r.left, y: r.top, w: r.width, h: r.height };
+    }
+    if (!dst.w) return null;
+    var dpr = window.devicePixelRatio || 1;
+    if (dpr > 2) dpr = 2;
+    var c = canvas.getBoundingClientRect();
+    return { x: c.left + dst.x / dpr, y: c.top + dst.y / dpr, w: dst.w / dpr, h: dst.h / dpr };
+  }
+
+  // Fit the stream into the viewport preserving aspect ratio, without relying
+  // on object-fit (unsupported on iOS 9).
+  function layoutMjpeg() {
+    if (!state.mjpeg) return;
+    var iw = mjpegImg.naturalWidth;
+    var ih = mjpegImg.naturalHeight;
+    if (!iw || !ih) return;
+    var cw = window.innerWidth, ch = window.innerHeight;
+    var s = Math.min(cw / iw, ch / ih);
+    var w = Math.round(iw * s), h = Math.round(ih * s);
+    mjpegImg.style.left = Math.round((cw - w) / 2) + 'px';
+    mjpegImg.style.top = Math.round((ch - h) / 2) + 'px';
+    mjpegImg.style.right = 'auto';
+    mjpegImg.style.bottom = 'auto';
+    mjpegImg.style.width = w + 'px';
+    mjpegImg.style.height = h + 'px';
+  }
+
+  function normPoint(t) {
+    var r = viewRect();
+    if (!r || !r.w || !r.h) return null;
+    return { x: (t.clientX - r.x) / r.w, y: (t.clientY - r.y) / r.h };
+  }
+
+  var scrollY = 0;
+
+  document.addEventListener('touchstart', function (e) {
+    if (e.touches.length >= 2) { scrollY = e.touches[0].clientY; return; }
+    var p = normPoint(e.touches[0]);
+    if (!p || p.x < 0 || p.x > 1 || p.y < 0 || p.y > 1) return;
+    touchDown = true;
+    ctlSend({ t: 'm', x: p.x, y: p.y });
+    ctlSend({ t: 'd' });
+    e.preventDefault();
+  }, false);
+
+  document.addEventListener('touchmove', function (e) {
+    if (e.touches.length >= 2) {
+      var dy = e.touches[0].clientY - scrollY;
+      if (Math.abs(dy) > 30) {
+        // Swipe up scrolls the content down, like a touchscreen.
+        ctlSend({ t: 's', n: dy > 0 ? -1 : 1 });
+        scrollY = e.touches[0].clientY;
+      }
+      e.preventDefault();
+      return;
+    }
+    if (!touchDown) return;
+    var now = (new Date()).getTime();
+    if (now - lastMoveAt < 33) return;   // ~30 Hz is plenty for a cursor
+    lastMoveAt = now;
+    var p = normPoint(e.touches[0]);
+    if (!p) return;
+    ctlSend({ t: 'm', x: Math.max(0, Math.min(1, p.x)), y: Math.max(0, Math.min(1, p.y)) });
+    e.preventDefault();
+  }, false);
+
+  document.addEventListener('touchend', function (e) {
+    if (!touchDown) return;
+    touchDown = false;
+    ctlSend({ t: 'u' });
+    e.preventDefault();
+  }, false);
+
+  document.addEventListener('touchcancel', function () {
+    if (!touchDown) return;
+    touchDown = false;
+    ctlSend({ t: 'u' });
+  }, false);
 
   // ---------------------------------------------------------------- start
   // Tapping hides Safari's chrome a little more reliably.
